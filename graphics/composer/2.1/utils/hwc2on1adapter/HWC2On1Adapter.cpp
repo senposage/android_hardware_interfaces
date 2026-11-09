@@ -25,12 +25,18 @@
 
 #include <inttypes.h>
 
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
+#include <strings.h>
 
+#include <cutils/properties.h>
 #include <hardware/hwcomposer.h>
 #include <log/log.h>
+#include <sync/sync.h>
 #include <utils/Trace.h>
 
 using namespace std::chrono_literals;
@@ -53,6 +59,44 @@ using namespace HWC2;
 static constexpr Attribute ColorMode = static_cast<Attribute>(6);
 
 namespace android {
+
+namespace {
+
+// This adapter is normally generic.  Suez uses an Android-5-era PowerVR /
+// HWC1 stack through it, however, and that stack has shown fence hand-off
+// stalls that cannot be diagnosed from SurfaceFlinger alone.  Keep the
+// instrumentation opt-in and read-only: it must never consume, close, or
+// otherwise alter a fence owned by the HWC1 implementation.
+constexpr char kSuezFenceTraceProperty[] = "persist.vendor.suez.hwc.trace_fences";
+
+bool suezFenceTracingEnabled() {
+    char value[PROPERTY_VALUE_MAX] = {};
+    property_get(kSuezFenceTraceProperty, value, "0");
+    return !strcmp(value, "1") || !strcasecmp(value, "true");
+}
+
+void traceSuezFence(const char* type, hwc2_display_t display, int fenceFd) {
+    if (!suezFenceTracingEnabled() || fenceFd < 0) {
+        return;
+    }
+
+    // An acquire fence is commonly unsignaled when handed to HWC, so sample
+    // successful and pending fences sparsely.  Invalid fences are always
+    // reported because they indicate an ABI or ownership failure.
+    static std::atomic<uint32_t> sampleCount{0};
+    const int result = sync_wait(fenceFd, 0);
+    if (result < 0 && errno != ETIME) {
+        ALOGE("suez-hwc: invalid %s fence %d on display %" PRIu64 ": %s",
+              type, fenceFd, display, strerror(errno));
+        return;
+    }
+    if ((sampleCount.fetch_add(1, std::memory_order_relaxed) % 120) == 0) {
+        ALOGI("suez-hwc: %s fence %d on display %" PRIu64 " is %s",
+              type, fenceFd, display, result == 0 ? "signaled" : "pending");
+    }
+}
+
+} // namespace
 
 class HWC2On1Adapter::Callbacks : public hwc_procs_t {
     public:
@@ -1294,7 +1338,12 @@ Error HWC2On1Adapter::Display::set(hwc_display_contents_1& hwcContents) {
     auto& clientTargetLayer = hwcContents.hwLayers[numLayers - 1];
     if (clientTargetLayer.compositionType == HWC_FRAMEBUFFER_TARGET) {
         clientTargetLayer.handle = mClientTarget.getBuffer();
+        // getFence() duplicates the adapter-owned fd for HWC1.  Do not close
+        // or replace it here: the HWC1 HAL must receive the acquire fence and
+        // owns the duplicate after set().
         clientTargetLayer.acquireFenceFd = mClientTarget.getFence();
+        traceSuezFence("client target acquire", mId,
+                       clientTargetLayer.acquireFenceFd);
     } else {
         ALOGE("[%" PRIu64 "] set: last HWC layer wasn't FRAMEBUFFER_TARGET",
                 mId);
@@ -2501,11 +2550,18 @@ Error HWC2On1Adapter::setAllDisplays() {
     }
 
     ALOGV("Calling HWC1 set");
+    int hwc1SetResult;
     {
         ATRACE_NAME("HWC1 set");
         //dumpHWC1Message(mHwc1Device, mHwc1Contents.size(), mHwc1Contents.data());
-        mHwc1Device->set(mHwc1Device, mHwc1Contents.size(),
-                mHwc1Contents.data());
+        hwc1SetResult = mHwc1Device->set(mHwc1Device, mHwc1Contents.size(),
+                                         mHwc1Contents.data());
+    }
+    if (hwc1SetResult != 0) {
+        // The legacy adapter used to discard this result.  Preserve the
+        // existing HWC2 transaction semantics, but make a vendor-HWC failure
+        // visible so it can be correlated with a missed frame or a bad fence.
+        ALOGE("suez-hwc: HWC1 set failed: %d", hwc1SetResult);
     }
 
     // Add retire and release fences
@@ -2517,6 +2573,7 @@ Error HWC2On1Adapter::setAllDisplays() {
         auto displayId = mHwc1DisplayMap[hwc1Id];
         auto& display = mDisplays[displayId];
         auto retireFenceFd = mHwc1Contents[hwc1Id]->retireFenceFd;
+        traceSuezFence("retire", displayId, retireFenceFd);
         ALOGV("setAllDisplays: Adding retire fence %d to display %zd",
                 retireFenceFd, hwc1Id);
         display->addRetireFence(mHwc1Contents[hwc1Id]->retireFenceFd);

@@ -39,6 +39,7 @@ cc_library_shared {
         "libutils",
         "libcutils",
         "liblog",
+        "libsync",
         "libhardware",
     ],
 
